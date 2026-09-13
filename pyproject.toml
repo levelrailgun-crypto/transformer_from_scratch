@@ -1,0 +1,17 @@
+[project]
+name = "transformer-from-scratch"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "levelup", email = "levelrailgun@icloud.com" }
+]
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+transformer-from-scratch = "transformer_from_scratch:main"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
