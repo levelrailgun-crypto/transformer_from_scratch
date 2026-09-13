@@ -71,3 +71,23 @@ class MokioMindConfig(PretrainedConfig):
             else None
         )
 
+import torch
+import torch.nn as nn
+#继承nn.Module类
+class RMSNorm(nn.Module):#基类继承，括号里是父类
+    #init初始化
+    def __init__(self,dim:int,eps:float=32):
+        super.__init__()#进行参数化
+        self.dim=dim
+        self.eps=eps
+        #利用Parameter类，将weight注册进RMSNorm实例的参数列表 `._parameters`，'.parameters'是父类属性
+        self.weight=nn.Parameter(torch.ones(dim))
+    #_norm下划线代表私用函数,这是RMSNorm公式的主要实现，最后乘上超参数gamma，即这里的weight
+    def _norm(self,x):#x是每个token向量的单个通道，之后要对每个token向量都遍历通道
+        #transformer中所有量都是张量，这里x是一维数组，其中最后一维为隐藏层维度，其等于1代表x是一维数组
+        return x*torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+self.eps)
+        #去掉keepdim=true会导致取平均值之后x的最后一维直接消失
+    #forward底层自动调用该函数
+    def forward(self,x):
+        return self.weight*self._norm(x.float()).type_as(x)
+        #float()默认是转化成32，因为eps是32位，所以以防万一将x临时转化成32位
