@@ -358,3 +358,51 @@ class FeedForward(nn.Module):
         def forward(self,x):
             gated=self.act_fn(self.gate_proj(x))*self.up_proj(x)
             return self.dropout(self.down_proj(gated))
+
+class MokioMindBlock(nn.Module):
+    def __init__(self,layer_id:int,config:MokioMindConfig):
+        super.__init__()
+        self.num_attention_heads=config.num_attention_heads
+        self.hidden_size=config.hidden_size
+        self.head_dim=self.hidden_size//self.num_attention_heads
+        self.attention=Attention(config)
+
+        self.layer_id=layer_id
+        self.input_layernorm=RMSNorm(config.hidden_size,eps=config.rms_norm_eps)
+        self.post_attention_layernorm=RMSNorm(
+            config.hidden_size,eps=config.rms_norm_eps
+        )
+        #前馈网络FFN
+        self.mlp=(
+            FeedForward(config)
+            if not config.use_moe
+            else MoEFeedForward(config)
+        )
+
+    def forward(
+        self,
+        #上一层transformer块输出的token向量，也就是这层的输入
+        hidden_states,
+        #RoPE 旋转位置编码
+        position_embeddings:Tuple[torch.Tensor,torch.Tensor],
+        past_key_value:Optional[Tuple[torch.Tensor,torch.Tensor]]=None,
+        use_cache=False,
+        attention_mask:Optional[torch.Tensor]=None,
+    ):
+
+        res=hidden_states
+
+        hidden_states,present_key_value=self.self_attention(
+            self.input_layernorm(hidden_states),#pre-norm
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask,
+        )
+
+        #以下是两个残差的加法
+        hidden_states=res+hidden_states
+        hidden_states=hidden_states+self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
+        return hidden_states,present_key_value
