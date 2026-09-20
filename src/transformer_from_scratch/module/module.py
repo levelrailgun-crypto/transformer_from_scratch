@@ -187,3 +187,174 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     )
     return q_embed, k_embed
 
+def repeat_kv(x:torch.Tensor,n_rep:int)->torch.Tensor:
+    #这里的x是刚经过RMSNorm和Linear映射的张量，所以会有4个维度
+    bs,slen,num_key_value_heads,head_dim=x.shape()
+    if n_rep == 1:
+        return x 
+    return (
+        x[:,:,:,None,:]
+        .expand(bs,slen,num_key_value_heads,n_rep,head_dim)
+        #将5维的x重新变成原来的4维
+        .reshape(bs,slen,num_key_value_heads*n_rep,head_dim)
+    )
+
+class Attention(nn.Module):
+    def __init__(self,args:MokioMindConfig):
+        super().__init__()
+
+        #如果没配置k,v头的数量就退化成MHA
+        #全局静态属性
+        self.num_key_value_heads=(
+            args.num_attention_heads 
+            if args.num_key_value_heads is None 
+            else args.self.num_key_value_heads
+        )
+
+        assert args.num_attention_heads%self.num_key_value_heads==0
+        "num_attention_heads must be divisible by num_key_value_heads"
+
+        #本地GPU属性，可被动态修改
+        self.n_local_heads=args.num_attention_heads
+        self.n_local_kv_heads=self.num_key_value_heads
+        self.n_rep=self.n_local_heads//self.n_local_kv_heads
+        self.head_dim=args.hidden_size//args.num_attention_heads
+
+        #RMSNorm后的Linear投影矩阵
+        #Linear只对最后的维度做操作，最后维度一定是hidden_dim，也就是token向量的维度
+        #1，Q投影矩阵，变换后维度不变
+        self.q_proj=nn.Linear(
+            args.hidden_size,args.num_attention_heads*self.head_dim,bias=False
+        )
+        #2，K投影矩阵，维度降低,Q,K,V的head_dim都是相等的
+        self.k_proj=nn.Linear(
+            args.hidden_size,self.num_key_value_heads*self.head_dim,bias=False
+        )
+        #3，V投影矩阵，维度降低
+        self.v_proj=nn.Linear(
+            args.hidden_size,self.num_key_value_heads*self.head_dim,bias=False
+        )
+        #4，O输出投影矩阵
+        # 对多头注意力拼接之后的多头 V 结果做线性变换，每个头的输出本身就是「V 的加权求和」
+        #这里将输出维度调整为原来的hidden_size
+        self.o_proj=nn.Linear(
+            args.num_attention_heads*self.head_dim,args.hidden_size,bias=False               
+        )
+
+        #定义一下接下来可能要用到的变量
+        self.attn_dropout=nn.Dropout(args.dropout)
+        #残差
+        self.resid_dropout=nn.Dropout(args.dropout)
+        self.dropout=args.dropout
+
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and args.flash_attention
+        )
+
+        def forward(
+            self,
+            x:torch.Tensor,
+            position_embeddings:Tuple[torch.Tensor,torch.Tensor],
+            past_key_value:Optional[Tuple[torch.Tensor,torch.Tensor]]=None,
+            use_cache=False,
+            attention_mask:Optional[torch.Tensor]=None,
+        ):
+            #在这里对seq_len进行动态赋值，当seq_len>1时，相当于新传入的token向量大于1，则在进行掩码时
+            #取倒数seq_len长度的key进行掩码操作
+            bsz,seq_len,_=x.shape
+            xq,xk,xv=self.q_proj(x),self.k_proj(x),self.v_proj(x)
+            xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+            xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+            xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+
+            cos,sin=position_embeddings
+            #对q,k矩阵进行旋转
+            xq,xk=apply_rotary_pos_emb(xq,xk,cos,sin)
+
+            #kv_cache实现
+            #不能在-1维拼接，会改变向量长度，在1维拼接能正好将两个向量拼接在一起
+            if past_key_value is not None:
+                xk=torch.cat([past_key_value[0],xk],dim=1)
+                xv=torch.cat([past_key_value[1],xv],dim=1)
+            past_kv=(xk,xv) if use_cache else None
+
+            xq,xk,xv=(
+                xq.transpose(1,2),
+                repeat_kv(xk,self.n_rep).transpose(1,2),
+                repeat_kv(xv,self.n_rep).transpose(1,2),
+            )
+
+            if (
+                self.flash
+                and (seq_len > 1)
+                and (past_key_value is None)
+                and (attention_mask is None or torch.all(attention_mask == 1))
+            ):
+                output=F.scaled_dot_product_attention(
+                    xq,
+                    xk,
+                    xv,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=True,
+                )
+
+            else:
+                scores=(xq@xk.transpose(-2,-1))/math.sqrt(self.head_dim)
+                #这里scores的倒数第一维是key长度，倒数第二维是q长度
+                scores[:,:,:,-seq_len:]+=torch.triu(
+                    torch.full((seq_len,seq_len),float("-inf"),device=scores.device),
+                    #diagonal=0是主对角线
+                    diagonal=1
+                )
+
+                #padding 掩码 + softmax 求注意力权重 + 用权重加权 V。
+                #attention_mask[b, t] = 1：第 b 条样本，第 t 个位置，真实 token，允许看
+                #attention_mask[b, t] = 0：第 b 条样本，第 t 个位置，pad填充，禁止看
+                #attention_mask is None：batch 所有句子一样长，没有 pad，不需要处理 pad
+                if attention_mask is not None:
+                    #attention_mask [B, Lk],unsqueeze(1)→[B, 1, Lk],unsqueeze(2)→[B, 1, 1, Lk]
+                    extended_attention_mask=attention_mask.unsqueeze(1).unsqueeze(2)
+                    #如果原始 mask=1（真实 token）：`1-1 =0` → 0 * -1e9 = 0，加到 scores 上，分数不变
+                    #如果原始 mask=0（padding）：`1-0 =1` → 1 * -1e9 = -1e9
+                    #padding 位置的分数会被加上一个超级小的负数。
+                    extended_attention_mask=(1.0-extended_attention_mask)*(-1e9)
+                    scores+=extended_attention_mask
+
+                scores=F.softmax(scores.float(),dim=-1).type_as(xq)
+                scores=self.attn_dropout(scores)
+                output=scores@xv
+
+            #H=num_heads，L=seq_len，Dh=head_dim
+            #原：[bsz, H, L, Dh]
+            #transpose(1,2) → [bsz, L, H, Dh]
+            #.reshape(bsz, seq_len, -1)，-1 自动推导：H * Dh。[bsz, L, H, Dh] → [bsz, L, H*Dh]
+            output=output.transpose(1,2).reshape(bsz.seq_len,-1)
+            #这里没有残差连接，实际上只是再经过了一层dropout
+            output=self.resid_dropout(self.o_proj(output))
+            return output,past_kv
+
+class FeedForward(nn.Module):
+    def __init__(self,config:MokioMindConfig):
+        super().__init__()
+        #SwiGLU升维系数，为了保持总参数不变，设置为接近三分之八
+        if config.intermediate_size is None:
+            intermediate_size=int(config.hidden_size*8/3)
+            #向下对齐64Tensor Core颗粒度
+            config.intermediate_size=64*((intermediate_size+64-1)//64)
+            self.gate_proj=nn.Linear(
+                config.hidden_size,config.intermediate_size,bias=False
+            )
+            self.down_proj=nn.Linear(
+                config.intermediate_size,config.hidden_size,bias=False
+            )
+            self.up_proj=nn.Linear(
+                config.hidden_size,config.intermediate_size,bias=False
+            )
+            self.dropout=nn.Dropout(config.dropout)
+            #hidden_act是silu字符串
+            self.act_fn=ACT2FN[config.hidden_act]
+
+        def forward(self,x):
+            gated=self.act_fn(self.gate_proj(x))*self.up_proj(x)
+            return self.dropout(self.down_proj(gated))
