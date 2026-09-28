@@ -12,6 +12,10 @@ dependencies = [
     "torchaudio>=2.11.0",
     "torchvision>=0.29.0",
     "transformers>=5.17.0",
+    # pyproject.toml 的 dependencies 里补
+    "datasets>=2.20.0",
+    "swanlab>=0.4.0",      
+    "numpy>=1.26.0",
 ]
 
 [project.scripts]
